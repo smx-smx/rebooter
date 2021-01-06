@@ -55,28 +55,34 @@ int file_read(struct file *file, unsigned long long offset, unsigned char *data,
     return ret;
 }
 
-static void (*soft_restart)(unsigned long addr) = NULL;
+static void (*fn_soft_restart)(unsigned long addr) = NULL;
+static void (*fn_smp_send_stop)(void) = NULL;
 
 static int resolve_syms(void){
-    soft_restart = (void *)kallsyms_lookup_name("soft_restart");
-    if(soft_restart == NULL)
+    fn_soft_restart = (void *)kallsyms_lookup_name("soft_restart");
+    fn_smp_send_stop = (void *)kallsyms_lookup_name("smp_send_stop");
+    
+    if(fn_soft_restart == NULL
+      || fn_smp_send_stop == NULL
+    ){
         return -1;
+    }
     return 0;
 }
 
-static void *pCodePhys;
-
-static int load_code(void){
+static void *load_code(size_t *codeSize){
     struct kstat stat;
     struct file *f = file_open(BOOT_FILE, O_RDONLY, 0);
     mm_segment_t oldfs;
     int err = 0;
     int i, numPages;
-    void *codeVirt;
     struct page *codePages;
+    void *codeVirt = NULL;
+
+    *codeSize = 0;
 
     if(f == NULL){
-        return -1;
+        return NULL;
     }
 
     oldfs = get_fs();
@@ -95,7 +101,7 @@ static int load_code(void){
     codeVirt = kzalloc(stat.size, GFP_KERNEL);
     if(codeVirt == NULL){
         printk(KERN_INFO "kzalloc failed");
-        return 1;
+        return NULL;
     }
 
     codePages = virt_to_page(codeVirt);
@@ -110,39 +116,46 @@ static int load_code(void){
         printk(KERN_INFO "Reading failed\n");
     }
     file_close(f);
+    
+    *codeSize = stat.size;
+    return codeVirt;
+}
 
+static void do_reboot(void *codeVirt, size_t codeSize){
+    void *pCodePhys = NULL;
+
+    printk(KERN_INFO "stopping secondary cores\n");
+    fn_smp_send_stop();
+   
     pCodePhys = (void *)virt_to_phys(codeVirt);
     printk(KERN_INFO "flush\n");
     flush_icache_range(
         (unsigned long) pCodePhys,
-	    (unsigned long) pCodePhys + stat.size
+	    (unsigned long) pCodePhys + codeSize
     );
 
-    return 0;
-}
-
-static void do_reboot(void){
-
-    printk(KERN_INFO "stopping secondary core\n");
-    cpu_down(1);
-
-    BUG_ON(num_online_cpus() > 1);
-
     printk(KERN_INFO "Bye!\n");
-    soft_restart((unsigned long)pCodePhys);
+
+    fn_soft_restart((unsigned long)pCodePhys);
 }
 
 
 static int __init rebooter_init(void){
+    size_t codeSize = 0;
+    void *codeVirt = NULL;
+
     if(resolve_syms() != 0){
         printk(KERN_INFO "resolve_syms() failed\n");
         return 1;
     }
-    if(load_code() != 0){
+
+    codeVirt = load_code(&codeSize);
+    if(codeVirt == NULL){
         printk(KERN_INFO "load_code() failed\n");
         return 1;
     }
-    do_reboot();
+
+    do_reboot(codeVirt, codeSize);
     printk(KERN_INFO "do_reboot() failed\n");
     return 0;
 }
